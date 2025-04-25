@@ -1,0 +1,459 @@
+import asyncio
+import aiofiles
+import os
+import time
+import json
+import logging
+from typing import Optional, List, Dict
+
+SOCKET_PATH = str(os.getenv("USER_DB_PATH"))
+
+RECORD_LIMIT = 5000
+FIELD_SEPARATOR = b'|'
+FIELDS = ['id', 'username', 'password_hash', 'ip_reg', 'last_logged', 'last_ip']
+MAX_LENGTHS = {
+    'username': 24,
+    'password_hash': 64,
+    'ip_reg': 16,
+    'last_logged': 19,
+    'last_ip': 16,
+}
+LOG_LIMIT = 100
+RECORD_SIZE = sum(MAX_LENGTHS.get(f, 0) for f in FIELDS[1:]) + (len(FIELDS) - 1) + 10
+
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+class ShardManager:
+    def __init__(self, base_path: str = 'shards'):
+        self.base_path = base_path
+        self._lock = asyncio.Lock()
+        try:
+            os.makedirs(self.base_path, exist_ok=True)
+            if not os.access(self.base_path, os.W_OK | os.R_OK):
+                logging.error(f"No read/write permissions for {self.base_path}")
+                raise OSError(f"No read/write permissions for {self.base_path}")
+        except OSError as e:
+            logging.error(f"Failed to create directory {self.base_path}: {e}")
+            raise
+
+    @staticmethod
+    def _sanitize_shard_prefix(username: str) -> str:
+        if not username or not username[0].isalpha():
+            return 'q'
+        return username[0].lower()
+
+    @staticmethod
+    def _clean_field(value: str) -> str:
+        return value.replace('\n', '').replace('|', '')
+
+    def _get_shard_info_path(self, prefix: str) -> str:
+        return os.path.join(self.base_path, f'{prefix}.info')
+
+    def _get_shard_data_path(self, prefix: str, index: int) -> str:
+        return os.path.join(self.base_path, f'{prefix}{index}')
+
+    @staticmethod
+    def _validate_ref(ref: str) -> tuple[str, int]:
+        try:
+            shard, idx = ref.split(':')
+            return shard, int(idx)
+        except ValueError:
+            raise ValueError(f"Invalid reference format: {ref}")
+
+    def _load_info_sync(self, prefix: str) -> Dict:
+        path = self._get_shard_info_path(prefix)
+        try:
+            if not os.path.exists(path):
+                return {'shards': 0, 'free': {}, 'log': []}
+            if not os.access(path, os.R_OK):
+                logging.error(f"No read permission for {path}")
+                return {'shards': 0, 'free': {}, 'log': []}
+            with open(path, 'r') as f:
+                content = f.read()
+                if not content.strip():
+                    logging.error(f"Empty info file at {path}")
+                    return {'shards': 0, 'free': {}, 'log': []}
+                try:
+                    data = json.loads(content)
+                except json.JSONDecodeError as e:
+                    logging.error(f"Invalid JSON in {path}: {e}")
+                    return {'shards': 0, 'free': {}, 'log': []}
+                if not isinstance(data, dict) or 'shards' not in data or 'free' not in data or 'log' not in data:
+                    logging.error(f"Invalid info structure at {path}")
+                    return {'shards': 0, 'free': {}, 'log': []}
+                return data
+        except OSError as e:
+            logging.error(f"Failed to load info from {path}: {e}")
+            return {'shards': 0, 'free': {}, 'log': []}
+
+    async def _load_info(self, prefix: str) -> Dict:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._load_info_sync, prefix)
+
+    def _save_info_sync(self, prefix: str, info: Dict):
+        path = self._get_shard_info_path(prefix)
+        temp_path = path + '.tmp'
+        try:
+            with open(temp_path, 'w') as f:
+                f.write(json.dumps(info, indent=2))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_path, path)
+            os.chmod(path, 0o644)
+        except OSError as e:
+            logging.error(f"Failed to save info for {prefix}: {e}")
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise
+
+    async def _save_info(self, prefix: str, info: Dict):
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._save_info_sync, prefix, info)
+
+    @staticmethod
+    async def _get_next_id(data_path: str, info: Dict, shard_index: int) -> int:
+        free = info['free'].get(str(shard_index), [])
+        if free:
+            next_id = free.pop(0)
+            return next_id
+        try:
+            if not os.path.exists(data_path):
+                return 0
+            async with aiofiles.open(data_path, 'rb') as f:
+                await f.seek(0, os.SEEK_END)
+                file_size = await f.tell()
+                count = file_size // RECORD_SIZE
+                return count
+        except OSError as e:
+            logging.error(f"Failed to count records in {data_path}: {e}")
+            raise
+
+    @staticmethod
+    async def _write_record(data_path: str, record_id: int, data: bytes):
+        try:
+            mode = 'r+b' if os.path.exists(data_path) else 'wb'
+            async with aiofiles.open(data_path, mode) as f:
+                await f.seek(record_id * RECORD_SIZE)
+                if len(data) != RECORD_SIZE:
+                    logging.error(f"Invalid record size: expected {RECORD_SIZE}, got {len(data)}")
+                    raise ValueError(f"Invalid record size: expected {RECORD_SIZE}, got {len(data)}")
+                await f.write(data)
+                await f.flush()
+        except OSError as e:
+            logging.error(f"Failed to write record to {data_path}: {e}")
+            raise
+
+    @staticmethod
+    def _validate_fields(**kwargs) -> None:
+        for field, value in kwargs.items():
+            if field in MAX_LENGTHS and len(value) > MAX_LENGTHS[field]:
+                raise ValueError(f"{field} exceeds maximum length of {MAX_LENGTHS[field]}")
+            if not isinstance(value, str):
+                raise ValueError(f"{field} must be a string")
+
+    async def add_record(self, username: str, password_hash: str, ip_reg: str,
+                         last_logged: str, last_ip: str) -> str:
+        if not username or not username[0].isalpha():
+            raise ValueError("Username must start with a letter")
+
+        cleaned_fields = {
+            'username': self._clean_field(username),
+            'password_hash': self._clean_field(password_hash),
+            'ip_reg': self._clean_field(ip_reg),
+            'last_logged': self._clean_field(last_logged),
+            'last_ip': self._clean_field(last_ip)
+        }
+        self._validate_fields(**cleaned_fields)
+
+        prefix = self._sanitize_shard_prefix(cleaned_fields['username'])
+        async with self._lock:
+            info = await self._load_info(prefix)
+            shard_index = info['shards'] - 1 if info['shards'] else 0
+            data_path = self._get_shard_data_path(prefix, shard_index)
+
+            info['free'].setdefault(str(shard_index), [])
+            id_ = await self._get_next_id(data_path, info, shard_index)
+            if id_ >= RECORD_LIMIT:
+                shard_index += 1
+                info['shards'] = shard_index + 1
+                data_path = self._get_shard_data_path(prefix, shard_index)
+                id_ = 0
+                info['free'][str(shard_index)] = []
+            elif info['shards'] == 0:
+                info['shards'] = 1
+
+            fields = [
+                str(id_).ljust(10),
+                cleaned_fields['username'].ljust(MAX_LENGTHS['username']),
+                cleaned_fields['password_hash'].ljust(MAX_LENGTHS['password_hash']),
+                cleaned_fields['ip_reg'].ljust(MAX_LENGTHS['ip_reg']),
+                cleaned_fields['last_logged'].ljust(MAX_LENGTHS['last_logged']),
+                cleaned_fields['last_ip'].ljust(MAX_LENGTHS['last_ip'])
+            ]
+            record_parts = []
+            for k, f in zip(FIELDS, fields):
+                max_len = MAX_LENGTHS.get(k, 10)
+                encoded = f.encode()
+                padded = encoded.ljust(max_len, b' ')
+                record_parts.append(padded)
+            record = FIELD_SEPARATOR.join(record_parts)
+
+            await self._write_record(data_path, id_, record)
+            ts = int(time.time())
+            info['log'].append((ts, f'CREATE {prefix}{shard_index}:{id_}'))
+            info['log'] = info['log'][-LOG_LIMIT:]
+            await self._save_info(prefix, info)
+
+        return f'{prefix}{shard_index}:{id_}'
+
+    async def get_record(self, ref: str, fields: Optional[List[str]] = None) -> Optional[Dict[str, str]]:
+        try:
+            shard, record_id = self._validate_ref(ref)
+            prefix, shard_index = shard[:-1], int(shard[-1])
+            path = self._get_shard_data_path(prefix, shard_index)
+            if not os.path.exists(path):
+                return None
+            async with aiofiles.open(path, 'rb') as f:
+                await f.seek(record_id * RECORD_SIZE)
+                raw = await f.read(RECORD_SIZE)
+                if len(raw) != RECORD_SIZE:
+                    logging.warning(f"Record {ref} is incomplete or does not exist")
+                    return None
+                parts = raw.split(FIELD_SEPARATOR)
+                if len(parts) != len(FIELDS):
+                    logging.error(f"Malformed record at {ref}")
+                    return None
+                result = {}
+                for i, field in enumerate(FIELDS):
+                    value = parts[i].decode('utf-8', errors='ignore').strip()
+                    if fields is None or field in fields:
+                        result[field] = value
+                return result
+        except Exception as e:
+            logging.error(f"Failed to get record {ref}: {e}")
+            return None
+
+    async def delete_record(self, ref: str) -> bool:
+        try:
+            shard, record_id = self._validate_ref(ref)
+            prefix, shard_index = shard[:-1], int(shard[-1])
+            path = self._get_shard_data_path(prefix, shard_index)
+            async with self._lock:
+                info = await self._load_info(prefix)
+                async with aiofiles.open(path, 'r+b') as f:
+                    await f.seek(record_id * RECORD_SIZE)
+                    await f.write(b'\x00' * RECORD_SIZE)
+                    await f.flush()
+                info['free'].setdefault(str(shard_index), []).append(record_id)
+                ts = int(time.time())
+                info['log'].append((ts, f'DELETE {shard}:{record_id}'))
+                info['log'] = info['log'][-LOG_LIMIT:]
+                await self._save_info(prefix, info)
+            return True
+        except (ValueError, OSError) as e:
+            logging.error(f"Failed to delete record {ref}: {e}")
+            return False
+
+    async def update_record(self, ref: str, updates: Dict[str, str]) -> bool:
+        try:
+            shard, record_id = self._validate_ref(ref)
+            prefix, shard_index = shard[:-1], int(shard[-1])
+            path = self._get_shard_data_path(prefix, shard_index)
+            record = await self.get_record(ref)
+            if not record:
+                return False
+            cleaned_updates = {k: self._clean_field(v) for k, v in updates.items()}
+            self._validate_fields(**cleaned_updates)
+            record.update({k: v[:MAX_LENGTHS[k]] for k, v in updates.items() if k in MAX_LENGTHS})
+            record['id'] = str(record_id).ljust(10)
+            record_parts = []
+            for k in FIELDS:
+                max_len = MAX_LENGTHS.get(k, 10)
+                encoded = record[k].encode()
+                padded = encoded.ljust(max_len, b' ')
+                record_parts.append(padded)
+            data = FIELD_SEPARATOR.join(record_parts)
+            await self._write_record(path, record_id, data)
+            async with self._lock:
+                info = await self._load_info(prefix)
+                ts = int(time.time())
+                info['log'].append((ts, f'UPDATE {shard}:{record_id}'))
+                info['log'] = info['log'][-LOG_LIMIT:]
+                await self._save_info(prefix, info)
+            return True
+        except (ValueError, OSError) as e:
+            logging.error(f"Failed to update record {ref}: {e}")
+            return False
+
+    async def find_records(self, field: str, value: str,
+                           fields: Optional[List[str]] = None) -> List[Dict[str, str]]:
+        if field not in FIELDS:
+            raise ValueError(f"Invalid field: {field}")
+        result = []
+        try:
+            for fname in os.listdir(self.base_path):
+                if fname.endswith('.info'):
+                    prefix = fname.split('.')[0]
+                    info = await self._load_info(prefix)
+                    for i in range(info['shards']):
+                        path = self._get_shard_data_path(prefix, i)
+                        if not os.path.exists(path):
+                            continue
+                        async with aiofiles.open(path, 'rb') as f:
+                            await f.seek(0, os.SEEK_END)
+                            file_size = await f.tell()
+                            record_count = file_size // RECORD_SIZE
+                            for record_id in range(record_count):
+                                await f.seek(record_id * RECORD_SIZE)
+                                raw = await f.read(RECORD_SIZE)
+                                if len(raw) != RECORD_SIZE:
+                                    logging.error(
+                                        f"Corrupted record size at {prefix}{i}:{record_id}: expected {RECORD_SIZE}, got {len(raw)}")
+                                    continue
+                                if not raw.strip():
+                                    continue
+                                values = raw.split(FIELD_SEPARATOR)
+                                if len(values) != len(FIELDS):
+                                    logging.error(f"Corrupted record at {prefix}{i}:{record_id}")
+                                    continue
+                                record = {k: v.decode().strip() for k, v in zip(FIELDS, values)}
+                                if record.get(field) == value:
+                                    ref = f'{prefix}{i}:{record_id}'
+                                    entry = {'ref': ref}
+                                    if fields:
+                                        entry.update({k: record[k] for k in fields if k in record})
+                                    result.append(entry)
+            return result
+        except OSError as e:
+            logging.error(f"Failed to search records: {e}")
+            return []
+
+
+async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    addr = writer.get_extra_info('peername')
+    logging.info(f"New client connected: {addr}")
+
+    manager = ShardManager()
+
+    try:
+        while True:
+            data = await reader.readline()
+            if not data:
+                break
+
+            request = data.decode().strip()
+            logging.info(f"Received: {request}")
+
+            if request.startswith("CREATE "):
+                try:
+                    parts = request.split(' ', maxsplit=5)
+                    if len(parts) != 6:
+                        raise ValueError("Invalid CREATE format. Use: CREATE username pwdhash ip time ip2")
+                    _, username, pwdhash, ip_reg, last_logged, last_ip = parts
+                    ref = await manager.add_record(username, pwdhash, ip_reg, last_logged, last_ip)
+                    writer.write(f"OK {ref}\n".encode())
+                except Exception as e:
+                    writer.write(f"ERROR {str(e)}\n".encode())
+
+            elif request.startswith("GET "):
+                try:
+                    parts = request.split(' ', maxsplit=2)
+                    if len(parts) < 2:
+                        raise ValueError("Invalid GET format. Use: GET ref [fields]")
+                    ref = parts[1]
+                    fields = parts[2].split(',') if len(parts) == 3 and parts[2] else None
+                    if fields:
+                        invalid_fields = [f for f in fields if f not in FIELDS]
+                        if invalid_fields:
+                            raise ValueError(f"Invalid fields: {', '.join(invalid_fields)}")
+                    record = await manager.get_record(ref, fields)
+                    if record is None:
+                        raise ValueError(f"Record {ref} not found")
+                    writer.write(f"OK {json.dumps(record)}\n".encode())
+                except Exception as e:
+                    writer.write(f"ERROR {str(e)}\n".encode())
+
+            elif request.startswith("DELETE "):
+                try:
+                    parts = request.split(' ', maxsplit=1)
+                    if len(parts) != 2:
+                        raise ValueError("Invalid DELETE format. Use: DELETE ref")
+                    ref = parts[1]
+                    success = await manager.delete_record(ref)
+                    if not success:
+                        raise ValueError(f"Failed to delete record {ref}")
+                    writer.write("OK Deleted\n".encode())
+                except Exception as e:
+                    writer.write(f"ERROR {str(e)}\n".encode())
+
+            elif request.startswith("UPDATE "):
+                try:
+                    parts = request.split(' ', maxsplit=2)
+                    if len(parts) < 3:
+                        raise ValueError("Invalid UPDATE format. Use: UPDATE ref field1=value1 field2=value2 ...")
+                    ref = parts[1]
+                    updates = {}
+                    for pair in parts[2].split():
+                        if '=' not in pair:
+                            raise ValueError(f"Invalid update pair: {pair}")
+                        key, value = pair.split('=', 1)
+                        if key not in FIELDS:
+                            raise ValueError(f"Invalid field: {key}")
+                        updates[key] = value
+                    success = await manager.update_record(ref, updates)
+                    if not success:
+                        raise ValueError(f"Failed to update record {ref}")
+                    writer.write("OK Updated\n".encode())
+                except Exception as e:
+                    writer.write(f"ERROR {str(e)}\n".encode())
+
+            elif request.startswith("FIND "):
+                try:
+                    parts = request.split(' ', maxsplit=3)
+                    if len(parts) < 3:
+                        raise ValueError("Invalid FIND format. Use: FIND field value [fields]")
+                    field, value = parts[1], parts[2]
+                    fields = parts[3].split(',') if len(parts) == 4 and parts[3] else None
+                    if field not in FIELDS:
+                        raise ValueError(f"Invalid field: {field}")
+                    if fields:
+                        invalid_fields = [f for f in fields if f not in FIELDS]
+                        if invalid_fields:
+                            raise ValueError(f"Invalid fields: {', '.join(invalid_fields)}")
+                    records = await manager.find_records(field, value, fields)
+                    writer.write(f"OK {json.dumps(records)}\n".encode())
+                except Exception as e:
+                    writer.write(f"ERROR {str(e)}\n".encode())
+
+            else:
+                writer.write("UNKNOWN COMMAND\n".encode())
+
+            await writer.drain()
+    except Exception as e:
+        logging.error(f"Error during client handling: {e}")
+    finally:
+        writer.close()
+        await writer.wait_closed()
+        logging.info(f"Client disconnected: {addr}")
+
+
+async def start_unix_socket_server():
+    if os.path.exists(SOCKET_PATH):
+        os.remove(SOCKET_PATH)
+
+    server = await asyncio.start_unix_server(handle_client, path=SOCKET_PATH)
+    logging.info(f"UNIX socket server started at {SOCKET_PATH}")
+
+    async with server:
+        await server.serve_forever()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(start_unix_socket_server())
+    except KeyboardInterrupt:
+        logging.info("Server stopped manually.")
+    finally:
+        if os.path.exists(SOCKET_PATH):
+            os.remove(SOCKET_PATH)

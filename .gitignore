@@ -1,0 +1,5 @@
+.DS_Store
+samp_users_db.sock
+shards/
+.idea/
+.vscode/
