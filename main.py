@@ -5,9 +5,9 @@ import time
 import json
 import logging
 from typing import Optional, List, Dict
+import pandas as pd
 
-SOCKET_PATH = str(os.getenv("USER_DB_PATH"))
-
+SOCKET_PATH = str(os.getenv("USER_DB_PATH", "/tmp/user_db.sock"))
 RECORD_LIMIT = 5000
 FIELD_SEPARATOR = b'|'
 FIELDS = ['id', 'username', 'password_hash', 'ip_reg', 'last_logged', 'last_ip']
@@ -20,6 +20,8 @@ MAX_LENGTHS = {
 }
 LOG_LIMIT = 100
 RECORD_SIZE = sum(MAX_LENGTHS.get(f, 0) for f in FIELDS[1:]) + (len(FIELDS) - 1) + 10
+TTL_SECONDS = 5 * 3600  # 5 hours
+IO_TIMEOUT = 5.0  # Timeout for I/O operations in seconds
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -28,6 +30,7 @@ class ShardManager:
     def __init__(self, base_path: str = 'shards'):
         self.base_path = base_path
         self._lock = asyncio.Lock()
+        self.cache = pd.DataFrame(columns=['ref'] + FIELDS + ['timestamp'])
         try:
             os.makedirs(self.base_path, exist_ok=True)
             if not os.access(self.base_path, os.W_OK | os.R_OK):
@@ -89,7 +92,14 @@ class ShardManager:
 
     async def _load_info(self, prefix: str) -> Dict:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._load_info_sync, prefix)
+        try:
+            return await asyncio.wait_for(
+                loop.run_in_executor(None, self._load_info_sync, prefix),
+                timeout=IO_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logging.error(f"Timeout loading info for prefix {prefix}")
+            raise
 
     def _save_info_sync(self, prefix: str, info: Dict):
         path = self._get_shard_info_path(prefix)
@@ -109,7 +119,14 @@ class ShardManager:
 
     async def _save_info(self, prefix: str, info: Dict):
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._save_info_sync, prefix, info)
+        try:
+            await asyncio.wait_for(
+                loop.run_in_executor(None, self._save_info_sync, prefix, info),
+                timeout=IO_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logging.error(f"Timeout saving info for prefix {prefix}")
+            raise
 
     @staticmethod
     async def _get_next_id(data_path: str, info: Dict, shard_index: int) -> int:
@@ -152,8 +169,71 @@ class ShardManager:
             if not isinstance(value, str):
                 raise ValueError(f"{field} must be a string")
 
+    async def _remove_expired_records(self):
+        logging.debug("Starting _remove_expired_records")
+        current_time = int(time.time())
+        if self.cache.empty:
+            logging.debug("Cache is empty, no records to remove")
+            return
+
+        expired = self.cache[self.cache['timestamp'] < current_time - TTL_SECONDS]
+        if expired.empty:
+            logging.debug("No expired records found")
+            return
+
+        logging.debug(f"Found {len(expired)} expired records")
+        expired_by_prefix = {}
+        for ref in expired['ref']:
+            try:
+                shard, record_id = self._validate_ref(ref)
+                prefix, shard_index = shard[:-1], int(shard[-1])
+                if prefix not in expired_by_prefix:
+                    expired_by_prefix[prefix] = {}
+                expired_by_prefix[prefix].setdefault(shard_index, []).append(record_id)
+            except ValueError as e:
+                logging.error(f"Invalid ref in cache: {ref}, error: {e}")
+                continue
+
+        async with self._lock:
+            logging.debug("Acquired lock in _remove_expired_records")
+            for prefix, shards in expired_by_prefix.items():
+                logging.debug(f"Processing prefix: {prefix}")
+                try:
+                    info = await self._load_info(prefix)
+                    logging.debug(f"Loaded info for prefix: {prefix}")
+                    for shard_index, record_ids in shards.items():
+                        path = self._get_shard_data_path(prefix, shard_index)
+                        logging.debug(f"Processing shard: {path}")
+                        if not os.path.exists(path):
+                            logging.warning(f"Shard {path} does not exist")
+                            continue
+                        try:
+                            async with aiofiles.open(path, 'r+b') as f:
+                                for record_id in record_ids:
+                                    logging.debug(f"Deleting record {prefix}{shard_index}:{record_id}")
+                                    await f.seek(record_id * RECORD_SIZE)
+                                    await f.write(b'\x00' * RECORD_SIZE)
+                                await f.flush()
+                            info['free'].setdefault(str(shard_index), []).extend(record_ids)
+                            ts = int(time.time())
+                            for record_id in record_ids:
+                                info['log'].append((ts, f'DELETE {prefix}{shard_index}:{record_id} (TTL)'))
+                            info['log'] = info['log'][-LOG_LIMIT:]
+                            await self._save_info(prefix, info)
+                            logging.debug(f"Updated shard info for {prefix}{shard_index}")
+                        except Exception as e:
+                            logging.error(f"Failed to delete records in {path}: {e}")
+                            continue
+                except Exception as e:
+                    logging.error(f"Failed to process prefix {prefix}: {e}")
+                    continue
+            self.cache = self.cache[self.cache['timestamp'] >= current_time - TTL_SECONDS]
+            logging.debug("Cache updated, expired records removed")
+        logging.debug("Finished _remove_expired_records")
+
     async def add_record(self, username: str, password_hash: str, ip_reg: str,
                          last_logged: str, last_ip: str) -> str:
+        logging.debug(f"Starting add_record for username: {username}")
         if not username or not username[0].isalpha():
             raise ValueError("Username must start with a letter")
 
@@ -165,15 +245,21 @@ class ShardManager:
             'last_ip': self._clean_field(last_ip)
         }
         self._validate_fields(**cleaned_fields)
+        logging.debug("Fields validated")
 
         prefix = self._sanitize_shard_prefix(cleaned_fields['username'])
         async with self._lock:
+            logging.debug("Acquired lock")
+            await self._remove_expired_records()
+            logging.debug("Expired records removed")
             info = await self._load_info(prefix)
+            logging.debug("Shard info loaded")
             shard_index = info['shards'] - 1 if info['shards'] else 0
             data_path = self._get_shard_data_path(prefix, shard_index)
 
             info['free'].setdefault(str(shard_index), [])
             id_ = await self._get_next_id(data_path, info, shard_index)
+            logging.debug(f"Got next ID: {id_}")
             if id_ >= RECORD_LIMIT:
                 shard_index += 1
                 info['shards'] = shard_index + 1
@@ -198,21 +284,42 @@ class ShardManager:
                 padded = encoded.ljust(max_len, b' ')
                 record_parts.append(padded)
             record = FIELD_SEPARATOR.join(record_parts)
+            logging.debug("Record prepared")
 
             await self._write_record(data_path, id_, record)
+            logging.debug("Record written to shard")
+            ref = f'{prefix}{shard_index}:{id_}'
             ts = int(time.time())
-            info['log'].append((ts, f'CREATE {prefix}{shard_index}:{id_}'))
+            info['log'].append((ts, f'CREATE {ref}'))
             info['log'] = info['log'][-LOG_LIMIT:]
             await self._save_info(prefix, info)
+            logging.debug("Shard info saved")
 
-        return f'{prefix}{shard_index}:{id_}'
+            cache_entry = {'ref': ref, 'timestamp': ts}
+            for k, v in zip(FIELDS, fields):
+                cache_entry[k] = v.strip()
+            self.cache.loc[len(self.cache)] = cache_entry
+            logging.debug("Record added to cache")
+
+        logging.debug(f"Finished add_record, returning ref: {ref}")
+        return ref
 
     async def get_record(self, ref: str, fields: Optional[List[str]] = None) -> Optional[Dict[str, str]]:
+        logging.debug(f"Starting get_record for ref: {ref}")
+        await self._remove_expired_records()
+        cache_hit = self.cache[self.cache['ref'] == ref]
+        if not cache_hit.empty:
+            record = cache_hit.iloc[0].to_dict()
+            result = {k: record[k] for k in FIELDS if fields is None or k in fields}
+            logging.debug(f"Cache hit for {ref}")
+            return result
+
         try:
             shard, record_id = self._validate_ref(ref)
             prefix, shard_index = shard[:-1], int(shard[-1])
             path = self._get_shard_data_path(prefix, shard_index)
             if not os.path.exists(path):
+                logging.debug(f"Shard path {path} does not exist")
                 return None
             async with aiofiles.open(path, 'rb') as f:
                 await f.seek(record_id * RECORD_SIZE)
@@ -224,22 +331,25 @@ class ShardManager:
                 if len(parts) != len(FIELDS):
                     logging.error(f"Malformed record at {ref}")
                     return None
-                result = {}
-                for i, field in enumerate(FIELDS):
-                    value = parts[i].decode('utf-8', errors='ignore').strip()
-                    if fields is None or field in fields:
-                        result[field] = value
+                record = {k: v.decode('utf-8', errors='ignore').strip() for k, v in zip(FIELDS, parts)}
+                cache_entry = {'ref': ref, 'timestamp': int(time.time())}
+                cache_entry.update(record)
+                self.cache.loc[len(self.cache)] = cache_entry
+                logging.debug(f"Loaded {ref} into cache from shard")
+                result = {k: record[k] for k in FIELDS if fields is None or k in fields}
                 return result
         except Exception as e:
             logging.error(f"Failed to get record {ref}: {e}")
             return None
 
     async def delete_record(self, ref: str) -> bool:
+        logging.debug(f"Starting delete_record for ref: {ref}")
         try:
             shard, record_id = self._validate_ref(ref)
             prefix, shard_index = shard[:-1], int(shard[-1])
             path = self._get_shard_data_path(prefix, shard_index)
             async with self._lock:
+                await self._remove_expired_records()
                 info = await self._load_info(prefix)
                 async with aiofiles.open(path, 'r+b') as f:
                     await f.seek(record_id * RECORD_SIZE)
@@ -250,18 +360,23 @@ class ShardManager:
                 info['log'].append((ts, f'DELETE {shard}:{record_id}'))
                 info['log'] = info['log'][-LOG_LIMIT:]
                 await self._save_info(prefix, info)
+                self.cache = self.cache[self.cache['ref'] != ref]
+                logging.debug(f"Deleted {ref} from cache and shard")
             return True
         except (ValueError, OSError) as e:
             logging.error(f"Failed to delete record {ref}: {e}")
             return False
 
     async def update_record(self, ref: str, updates: Dict[str, str]) -> bool:
+        logging.debug(f"Starting update_record for ref: {ref}")
         try:
             shard, record_id = self._validate_ref(ref)
             prefix, shard_index = shard[:-1], int(shard[-1])
             path = self._get_shard_data_path(prefix, shard_index)
+            await self._remove_expired_records()
             record = await self.get_record(ref)
             if not record:
+                logging.debug(f"Record {ref} not found")
                 return False
             cleaned_updates = {k: self._clean_field(v) for k, v in updates.items()}
             self._validate_fields(**cleaned_updates)
@@ -281,6 +396,17 @@ class ShardManager:
                 info['log'].append((ts, f'UPDATE {shard}:{record_id}'))
                 info['log'] = info['log'][-LOG_LIMIT:]
                 await self._save_info(prefix, info)
+                cache_idx = self.cache[self.cache['ref'] == ref].index
+                if not cache_idx.empty:
+                    for k, v in cleaned_updates.items():
+                        if k in MAX_LENGTHS:
+                            self.cache.loc[cache_idx, k] = v[:MAX_LENGTHS[k]]
+                    self.cache.loc[cache_idx, 'timestamp'] = ts
+                else:
+                    cache_entry = {'ref': ref, 'timestamp': ts}
+                    cache_entry.update(record)
+                    self.cache.loc[len(self.cache)] = cache_entry
+                logging.debug(f"Updated {ref} in cache and shard")
             return True
         except (ValueError, OSError) as e:
             logging.error(f"Failed to update record {ref}: {e}")
@@ -288,9 +414,21 @@ class ShardManager:
 
     async def find_records(self, field: str, value: str,
                            fields: Optional[List[str]] = None) -> List[Dict[str, str]]:
+        logging.debug(f"Starting find_records for field: {field}, value: {value}")
         if field not in FIELDS:
             raise ValueError(f"Invalid field: {field}")
+        await self._remove_expired_records()
+        cache_hits = self.cache[self.cache[field] == value]
         result = []
+        for _, row in cache_hits.iterrows():
+            entry = {'ref': row['ref']}
+            if fields:
+                entry.update({k: row[k] for k in fields if k in row})
+            else:
+                entry.update({k: row[k] for k in FIELDS})
+            result.append(entry)
+        logging.debug(f"Found {len(result)} records in cache")
+
         try:
             for fname in os.listdir(self.base_path):
                 if fname.endswith('.info'):
@@ -318,12 +456,18 @@ class ShardManager:
                                     logging.error(f"Corrupted record at {prefix}{i}:{record_id}")
                                     continue
                                 record = {k: v.decode().strip() for k, v in zip(FIELDS, values)}
-                                if record.get(field) == value:
-                                    ref = f'{prefix}{i}:{record_id}'
+                                ref = f'{prefix}{i}:{record_id}'
+                                if record.get(field) == value and ref not in self.cache['ref'].values:
+                                    cache_entry = {'ref': ref, 'timestamp': int(time.time())}
+                                    cache_entry.update(record)
+                                    self.cache.loc[len(self.cache)] = cache_entry
                                     entry = {'ref': ref}
                                     if fields:
                                         entry.update({k: record[k] for k in fields if k in record})
+                                    else:
+                                        entry.update(record)
                                     result.append(entry)
+            logging.debug(f"Total records found: {len(result)}")
             return result
         except OSError as e:
             logging.error(f"Failed to search records: {e}")

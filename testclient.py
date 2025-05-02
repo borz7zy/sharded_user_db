@@ -4,7 +4,7 @@ import os
 
 
 async def send_command(command: str) -> str:
-    reader, writer = await asyncio.open_unix_connection(str(os.getenv("USER_DB_PATH")))
+    reader, writer = await asyncio.open_unix_connection(str(os.getenv("USER_DB_PATH", "/tmp/user_db.sock")))
     try:
         writer.write(f"{command}\n".encode())
         await writer.drain()
