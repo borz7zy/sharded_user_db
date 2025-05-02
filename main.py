@@ -474,11 +474,9 @@ class ShardManager:
             return []
 
 
-async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, manager: ShardManager):
     addr = writer.get_extra_info('peername')
     logging.info(f"New client connected: {addr}")
-
-    manager = ShardManager()
 
     try:
         while True:
@@ -487,7 +485,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 break
 
             request = data.decode().strip()
-            logging.info(f"Received: {request}")
+            logging.debug(f"Received from {addr}: {request}")
 
             if request.startswith("CREATE "):
                 try:
@@ -497,8 +495,10 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     _, username, pwdhash, ip_reg, last_logged, last_ip = parts
                     ref = await manager.add_record(username, pwdhash, ip_reg, last_logged, last_ip)
                     writer.write(f"OK {ref}\n".encode())
+                    logging.info(f"CREATE successful for {addr}: {ref}")
                 except Exception as e:
                     writer.write(f"ERROR {str(e)}\n".encode())
+                    logging.warning(f"CREATE failed for {addr}: {e}")
 
             elif request.startswith("GET "):
                 try:
@@ -506,17 +506,23 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     if len(parts) < 2:
                         raise ValueError("Invalid GET format. Use: GET ref [fields]")
                     ref = parts[1]
-                    fields = parts[2].split(',') if len(parts) == 3 and parts[2] else None
+                    fields_str = parts[2] if len(parts) == 3 and parts[2] else None
+                    fields = fields_str.split(',') if fields_str else None
                     if fields:
                         invalid_fields = [f for f in fields if f not in FIELDS]
                         if invalid_fields:
                             raise ValueError(f"Invalid fields: {', '.join(invalid_fields)}")
                     record = await manager.get_record(ref, fields)
                     if record is None:
-                        raise ValueError(f"Record {ref} not found")
-                    writer.write(f"OK {json.dumps(record)}\n".encode())
+                        writer.write(f"ERROR Record {ref} not found\n".encode())
+                        logging.debug(
+                            f"GET failed for {addr}: Record {ref} not found")
+                    else:
+                        writer.write(f"OK {json.dumps(record)}\n".encode())
+                        logging.debug(f"GET successful for {addr}: {ref}")
                 except Exception as e:
                     writer.write(f"ERROR {str(e)}\n".encode())
+                    logging.warning(f"GET failed for {addr}: {e}")
 
             elif request.startswith("DELETE "):
                 try:
@@ -526,10 +532,13 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     ref = parts[1]
                     success = await manager.delete_record(ref)
                     if not success:
-                        raise ValueError(f"Failed to delete record {ref}")
-                    writer.write("OK Deleted\n".encode())
+                        writer.write(f"ERROR Failed to delete record {ref}\n".encode())
+                    else:
+                        writer.write("OK Deleted\n".encode())
+                        logging.info(f"DELETE successful for {addr}: {ref}")
                 except Exception as e:
                     writer.write(f"ERROR {str(e)}\n".encode())
+                    logging.warning(f"DELETE failed for {addr}: {e}")
 
             elif request.startswith("UPDATE "):
                 try:
@@ -543,14 +552,19 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                             raise ValueError(f"Invalid update pair: {pair}")
                         key, value = pair.split('=', 1)
                         if key not in FIELDS:
-                            raise ValueError(f"Invalid field: {key}")
+                            raise ValueError(f"Invalid field for update: {key}")
+                        if key == 'id':
+                            raise ValueError("Cannot update 'id' field")
                         updates[key] = value
                     success = await manager.update_record(ref, updates)
                     if not success:
-                        raise ValueError(f"Failed to update record {ref}")
-                    writer.write("OK Updated\n".encode())
+                        writer.write(f"ERROR Failed to update record {ref}\n".encode())
+                    else:
+                        writer.write("OK Updated\n".encode())
+                        logging.info(f"UPDATE successful for {addr}: {ref}")
                 except Exception as e:
                     writer.write(f"ERROR {str(e)}\n".encode())
+                    logging.warning(f"UPDATE failed for {addr}: {e}")
 
             elif request.startswith("FIND "):
                 try:
@@ -558,46 +572,87 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     if len(parts) < 3:
                         raise ValueError("Invalid FIND format. Use: FIND field value [fields]")
                     field, value = parts[1], parts[2]
-                    fields = parts[3].split(',') if len(parts) == 4 and parts[3] else None
+                    fields_str = parts[3] if len(parts) == 4 and parts[3] else None
+                    fields = fields_str.split(',') if fields_str else None
                     if field not in FIELDS:
-                        raise ValueError(f"Invalid field: {field}")
+                        raise ValueError(f"Invalid field for search: {field}")
                     if fields:
                         invalid_fields = [f for f in fields if f not in FIELDS]
                         if invalid_fields:
-                            raise ValueError(f"Invalid fields: {', '.join(invalid_fields)}")
+                            raise ValueError(f"Invalid fields requested: {', '.join(invalid_fields)}")
                     records = await manager.find_records(field, value, fields)
                     writer.write(f"OK {json.dumps(records)}\n".encode())
+                    logging.debug(f"FIND successful for {addr}: field={field}, value={value}, found={len(records)}")
                 except Exception as e:
                     writer.write(f"ERROR {str(e)}\n".encode())
+                    logging.warning(f"FIND failed for {addr}: {e}")
 
             else:
-                writer.write("UNKNOWN COMMAND\n".encode())
+                writer.write("ERROR UNKNOWN COMMAND\n".encode())
+                logging.warning(f"Unknown command from {addr}: {request}")
 
             await writer.drain()
+    except asyncio.CancelledError:
+        logging.info(f"Client handler for {addr} cancelled.")
+    except ConnectionResetError:
+        logging.info(f"Client {addr} disconnected abruptly.")
     except Exception as e:
-        logging.error(f"Error during client handling: {e}")
+        logging.error(f"Error during client handling for {addr}: {e}", exc_info=True)
     finally:
-        writer.close()
-        await writer.wait_closed()
-        logging.info(f"Client disconnected: {addr}")
+        if not writer.is_closing():
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception as e:
+                logging.error(f"Error closing writer for {addr}: {e}")
+        logging.info(f"Client connection closed: {addr}")
 
 
 async def start_unix_socket_server():
     if os.path.exists(SOCKET_PATH):
-        os.remove(SOCKET_PATH)
+        logging.warning(f"Socket file {SOCKET_PATH} already exists, removing.")
+        try:
+            os.remove(SOCKET_PATH)
+        except OSError as e:
+            logging.error(f"Failed to remove existing socket file {SOCKET_PATH}: {e}")
+            return
 
-    server = await asyncio.start_unix_server(handle_client, path=SOCKET_PATH)
-    logging.info(f"UNIX socket server started at {SOCKET_PATH}")
+    try:
+        manager = ShardManager(base_path='shards')
+        logging.info("ShardManager initialized successfully.")
+    except Exception as e:
+        logging.critical(f"Failed to initialize ShardManager: {e}", exc_info=True)
+        return
 
-    async with server:
-        await server.serve_forever()
+    server_factory = lambda: asyncio.start_unix_server(
+        lambda r, w: handle_client(r, w, manager),
+        path=SOCKET_PATH
+    )
+
+    try:
+        server = await server_factory()
+        logging.info(f"UNIX socket server started at {SOCKET_PATH}")
+
+        async with server:
+            await server.serve_forever()
+
+    except OSError as e:
+        logging.critical(f"Failed to start server at {SOCKET_PATH}: {e}", exc_info=True)
+    except Exception as e:
+        logging.critical(f"An unexpected error occurred in the server loop: {e}", exc_info=True)
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(start_unix_socket_server())
     except KeyboardInterrupt:
-        logging.info("Server stopped manually.")
+        logging.info("Server stopping due to KeyboardInterrupt.")
+    except Exception as e:
+        logging.critical(f"Server failed to run: {e}", exc_info=True)
     finally:
         if os.path.exists(SOCKET_PATH):
-            os.remove(SOCKET_PATH)
+            try:
+                os.remove(SOCKET_PATH)
+                logging.info(f"Removed socket file {SOCKET_PATH}.")
+            except OSError as e:
+                logging.error(f"Error removing socket file {SOCKET_PATH} on exit: {e}")
